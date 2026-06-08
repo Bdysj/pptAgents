@@ -4,38 +4,42 @@ Swagger UI is served at /docs ; OpenAPI JSON at /openapi.json.
 
 Endpoints:
   POST /api/presentations                     upload a source file -> create a job
-  GET  /api/presentations/{job_id}            poll job status + progress
-  GET  /api/presentations/{job_id}/download   download the result .zip (302 -> R2)
-                                              (zip bundles the .pptx + speaker-notes .md)
+  GET  /api/presentations/{job_id}            poll status + progress; returns the
+                                              PPTX + notes URLs once DONE
   POST /api/presentations/{job_id}/cancel     stop a running/queued job
   POST /api/presentations/{job_id}/retry      resume an interrupted/failed job
 """
 
 from __future__ import annotations
 
-import shutil
+import hashlib
+import json
+import os
+import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
 
 from . import queue
 from .config import settings
 from .db import init_db
 from .jobs import store
 from .progress import compute_progress
+from .prompt_template import resolve_style_preset
 from .registry import registry
 from .schemas import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     ActionResponse,
+    CanvasFormat,
     CreateJobResponse,
     ErrorResponse,
     FormulaPolicy,
-    IconStyle,
     ImageMode,
     JobStatus,
     JobStatusResponse,
+    OutputLanguage,
+    StylePreset,
 )
 
 app = FastAPI(
@@ -73,25 +77,87 @@ def healthz() -> dict[str, str]:
     response_model=CreateJobResponse,
     status_code=202,
     tags=["presentations"],
+    summary="提交源文档，创建生成任务",
+    description=(
+        "上传源文档并按所选参数异步生成 PPTX + 演讲稿。返回 `job_id`，随后用 "
+        "`GET /api/presentations/{job_id}` 轮询进度与下载链接。\n\n"
+        "**幂等 / 防重放**：请求指纹 = 文件内容(SHA-256) + 全部生成参数。若已存在**相同文件且相同参数**、"
+        "且处于进行中(PENDING/CONVERTING/GENERATING)或已完成(DONE)的任务，则**直接复用并返回那个 job_id**，"
+        "不会重复创建——多次点击/重复提交安全。失败、取消、中断、过期的任务不在复用范围(重交即重跑)。"
+        "改动任意参数或更换文件会被视为新任务。"
+    ),
     responses={400: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
 )
 async def create_presentation(
-    file: UploadFile = File(..., description="Source document: PDF / DOCX / MD / PPTX / XLSX / …"),
-    canvas_format: str = Form(settings.default_format, description="①画布格式，如 ppt169 / ppt43 / xhs。"),
-    page_count: str | None = Form(None, description="②页数范围，如 \"12-18\"；留空=按素材自动决定。"),
-    audience: str | None = Form(None, description="③目标受众；留空=通用商务/技术读者。"),
-    style_objective: str | None = Form(None, description="④风格目标，也可填风格简述（如 \"麦肯锡风\"）；留空=专业现代。"),
-    color_scheme: str | None = Form(None, description="⑤配色方案；留空=策划按主题自定。"),
-    icon_style: IconStyle = Form(IconStyle.line, description="⑥图标风格：line/filled/none。"),
-    typography: str | None = Form(None, description="⑦字体与排版描述；留空=无衬线中英文混排。"),
-    formula_policy: FormulaPolicy = Form(FormulaPolicy.mixed, description="⑦公式渲染策略：mixed/render-all/text-only。"),
-    image_mode: ImageMode = Form(ImageMode.ai, description="⑧配图方式：ai(gpt-image-2)/web/placeholder/none。"),
-    output_language: str | None = Form(
-        None,
+    file: UploadFile = File(
+        ...,
+        description="源文档：PDF / DOCX / Markdown / PPTX / XLSX / TXT 等。系统会自动转换为 Markdown 再生成。",
+    ),
+    canvas_format: CanvasFormat = Form(
+        CanvasFormat.ppt169,
         description=(
-            "输出语言，统一控制 PPT 正文与演讲稿语言。留空或 auto=跟随源素材语言；"
-            "可填 zh / zh-tw / en / ja / ko / fr / de / es / ru，或直接写语言名（如 \"简体中文\"）。"
-            "源素材可与目标语言不同（例如英文 docx 输出中文 PPT）。"
+            "画布尺寸/比例（决定产物长宽）。\n"
+            "• ppt169 —— 16:9 横版 PPT(1280×720)。【最常用】现代投影、线上汇报。\n"
+            "• ppt43 —— 4:3 横版 PPT(1024×768)。传统投影、老会议室、学术答辩。\n"
+            "• xiaohongshu —— 小红书竖图(1242×1660, 3:4)。图文种草、知识贴。\n"
+            "• moments —— 朋友圈/IG 方图(1080×1080, 1:1)。社交方形海报。\n"
+            "• story —— 竖屏故事(1080×1920, 9:16)。短视频封面、Story。\n"
+            "• wechat —— 公众号头图(900×383, 2.35:1)。文章封面。\n"
+            "• banner —— 横幅(1920×1080, 16:9)。网页 banner、大屏。\n"
+            "• a4 —— A4 打印(1240×1754)。打印/PDF。\n"
+            "选择建议：做汇报/演示选 ppt169(默认)；老设备/答辩选 ppt43；社媒内容按平台选对应竖/方图。"
+        ),
+    ),
+    style: StylePreset = Form(
+        StylePreset.modern,
+        description=(
+            "整体风格预设（同时决定版式语气与配色，已替代零散的风格/配色/字体/图标设置）。\n"
+            "• modern —— 通用现代。【默认】信息层级清晰、留白克制，适合绝大多数商务/技术汇报。\n"
+            "• mckinsey —— 顶级咨询(麦肯锡/MBB)。金字塔结构、结论先行、每页一句 Takeaway、数据配对比基准。"
+            "适合战略汇报、投资/尽调、高管决策材料。\n"
+            "• consulting —— 商务咨询。论点清晰、图表驱动、专业稳重。适合方案、项目汇报。\n"
+            "• tech —— 科技/产品。深色科技配色、强调架构与流程。适合产品发布、技术方案。\n"
+            "• academic —— 学术/科研。严谨克制、重公式与图表。适合论文汇报、开题答辩、学术报告。\n"
+            "• government —— 政务/党政。庄重权威、规范。适合工作汇报、政策解读、单位总结。"
+        ),
+    ),
+    page_count: int | None = Form(
+        None,
+        ge=1,
+        le=60,
+        description=(
+            "目标页数(数字)。留空=由系统按素材体量自动决定(建议 12–18 页)。"
+            "填具体数字则按该页数生成；常用区间：精简 8–12、标准 12–18、详尽 18–28。"
+        ),
+    ),
+    image_mode: ImageMode = Form(
+        ImageMode.ai,
+        description=(
+            "配图方式。\n"
+            "• ai —— 关键页用 AI(gpt-image-2)生成配图。【默认】成稿最完整，耗时/成本最高。\n"
+            "• web —— 关键页用网络图片搜索。真实图片，需联网。\n"
+            "• placeholder —— 仅用占位图，不实际拉图。最快，适合先看版式。\n"
+            "• none —— 纯文字/图形版式，完全不配图。适合极简或纯数据稿。"
+        ),
+    ),
+    formula_policy: FormulaPolicy = Form(
+        FormulaPolicy.mixed,
+        description=(
+            "公式渲染策略(仅含公式的稿件才有意义，如学术/技术)。\n"
+            "• mixed —— 【默认】复杂公式渲染成图片，简单表达式保留可编辑文本。\n"
+            "• render-all —— 所有公式都渲染成图片(最稳定，但不可编辑)。\n"
+            "• text-only —— 全部保留为可编辑文本/Unicode(可编辑，复杂公式可能不美观)。"
+        ),
+    ),
+    output_language: OutputLanguage = Form(
+        OutputLanguage.auto,
+        description=(
+            "输出语言，统一控制 PPT 正文与演讲稿的语言(可与源素材语言不同)。\n"
+            "• auto —— 【默认】跟随源素材语言(英文素材→英文成稿)。\n"
+            "• zh —— 简体中文。  • zh-tw —— 繁体中文。  • en —— English。\n"
+            "• ja —— 日本語。  • ko —— 한국어。  • fr —— Français。\n"
+            "• de —— Deutsch。  • es —— Español。  • ru —— Русский。\n"
+            "典型用法：英文 docx 想输出中文汇报 → 选 zh。"
         ),
     ),
 ) -> CreateJobResponse:
@@ -107,28 +173,76 @@ async def create_presentation(
 
     settings.ensure_dirs()
     safe_name = Path(file.filename).name
+
+    # Stream the upload to a temp file while hashing its bytes, so we can
+    # de-duplicate before committing it to the uploads dir.
+    digest = hashlib.sha256()
+    fd, tmp_path = tempfile.mkstemp(dir=str(settings.uploads_dir), suffix=".part")
+    with os.fdopen(fd, "wb") as out:
+        while True:
+            chunk = file.file.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    file_hash = digest.hexdigest()
+
+    # Resolve the style preset into the underlying eight-confirmation fields.
+    preset = resolve_style_preset(style.value)
+    lang = None if output_language == OutputLanguage.auto else output_language.value
+
+    # Request fingerprint = file content + every parameter that affects output.
+    fp_payload = json.dumps(
+        {
+            "file": file_hash,
+            "canvas_format": canvas_format.value,
+            "style": style.value,
+            "page_count": page_count,
+            "image_mode": image_mode.value,
+            "formula_policy": formula_policy.value,
+            "output_language": lang or "auto",
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    fingerprint = hashlib.sha256(fp_payload.encode("utf-8")).hexdigest()
+
+    # Idempotency / replay protection: reuse an identical in-flight or finished job.
+    existing = store.find_reusable(fingerprint)
+    if existing is not None:
+        os.unlink(tmp_path)  # discard the duplicate upload
+        return CreateJobResponse(
+            job_id=existing.job_id,
+            status=existing.status,
+            message=(
+                f"检测到相同文件与参数的任务，已复用现有任务 {existing.job_id}"
+                f"（当前状态 {existing.status.value}）。如需强制重新生成，请改动参数或文件。"
+            ),
+        )
+
+    # New request: move the temp upload to its final name (avoid collisions).
     dest = settings.uploads_dir / safe_name
     counter = 1
     while dest.exists():
         dest = settings.uploads_dir / f"{Path(safe_name).stem}_{counter}{Path(safe_name).suffix}"
         counter += 1
-    with dest.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
+    os.replace(tmp_path, dest)
 
     options = {
-        "page_count": page_count,
-        "audience": audience,
-        "style_objective": style_objective,
-        "color_scheme": color_scheme,
-        "icon_style": icon_style.value,
-        "typography": typography,
+        "page_count": str(page_count) if page_count else None,
+        "audience": None,  # inferred by the Strategist from content + style
+        "style_objective": preset["style_objective"],
+        "color_scheme": preset["color_scheme"],
+        "icon_style": preset["icon_style"],
+        "typography": preset["typography"],
         "formula_policy": formula_policy.value,
         "image_mode": image_mode.value,
-        "output_language": output_language,
+        "output_language": lang,
+        "style_preset": style.value,
     }
     job = store.create(
-        source_filename=safe_name, canvas_format=canvas_format,
-        upload_path=dest, options=options,
+        source_filename=safe_name, canvas_format=canvas_format.value,
+        upload_path=dest, options=options, fingerprint=fingerprint,
     )
     await queue.enqueue(job.job_id)
 
@@ -163,6 +277,7 @@ def _status_response(job) -> JobStatusResponse:
         pptx_filename=download_name,
         download_filename=download_name,
         download_url=job.r2_url,
+        notes_url=job.notes_url,
         attempts=job.attempts,
         error=job.error,
         created_at=job.created_at,
@@ -174,6 +289,18 @@ def _status_response(job) -> JobStatusResponse:
     "/api/presentations/{job_id}",
     response_model=JobStatusResponse,
     tags=["presentations"],
+    summary="查询任务状态 / 进度 / 下载链接",
+    description=(
+        "轮询单个任务的状态。\n\n"
+        "**处理中**(PENDING / CONVERTING / GENERATING)：返回 `progress`(0–100) 用于显示进度条；"
+        "`download_url` / `notes_url` 为 null。\n\n"
+        "**已完成**(DONE)：`progress`=100，并额外返回两个 Cloudflare 公开 URL（两个文件**分别上传**、"
+        "非压缩包，URL 已拼接好可直接访问）：\n"
+        "- `download_url` —— PPTX 文件，可直接下载或嵌入。\n"
+        "- `notes_url` —— 演讲稿 .md 文件（无备注时为 null）。\n\n"
+        "**失败/中断**(FAILED / INTERRUPTED)：`error` 给出原因；INTERRUPTED 可调用 `/retry` 续跑。\n\n"
+        "建议轮询间隔 2–5 秒。"
+    ),
     responses={404: {"model": ErrorResponse}},
 )
 def get_presentation(job_id: str) -> JobStatusResponse:
@@ -183,34 +310,15 @@ def get_presentation(job_id: str) -> JobStatusResponse:
     return _status_response(job)
 
 
-@app.get(
-    "/api/presentations/{job_id}/download",
-    tags=["presentations"],
-    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
-)
-def download_presentation(job_id: str):
-    """Download the finished job as a single .zip (deck + speaker-notes .md).
-    Redirects to the packaged zip served by Cloudflare R2; the service itself
-    serves no download bytes."""
-    job = store.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Unknown job_id.")
-    if job.status != JobStatus.DONE:
-        raise HTTPException(status_code=409, detail=f"Job is not finished (status={job.status.value}).")
-    if job.r2_url:
-        return RedirectResponse(url=job.r2_url, status_code=302)
-    if job.pptx_path and job.pptx_path.is_file():
-        return FileResponse(
-            path=str(job.pptx_path), filename=job.pptx_path.name,
-            media_type="application/zip",
-        )
-    raise HTTPException(status_code=404, detail="Result file is missing.")
-
-
 @app.post(
     "/api/presentations/{job_id}/cancel",
     response_model=ActionResponse,
     tags=["presentations"],
+    summary="取消一个排队中或正在生成的任务",
+    description=(
+        "停止任务。正在生成的会终止智能体进程并清理本地产物 + 已写入的 R2 对象，置为 CANCELLED；"
+        "排队中的直接置 CANCELLED 不再被领取。已处于终态(DONE/FAILED/CANCELLED/INTERRUPTED/EXPIRED)返回 409。"
+    ),
     responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
 )
 def cancel_presentation(job_id: str) -> ActionResponse:
@@ -234,6 +342,19 @@ def cancel_presentation(job_id: str) -> ActionResponse:
     "/api/presentations/{job_id}/retry",
     response_model=ActionResponse,
     tags=["presentations"],
+    summary="重试 / 断点续跑一个失败或中断的任务",
+    description=(
+        "对 **FAILED 或 INTERRUPTED** 的任务重新入队，从**断点续跑**——不是整段重来。\n\n"
+        "原理：之前运行落盘的中间产物(策划大纲、已生成的页 SVG、配图、备注等)都保留着；"
+        "续跑时智能体会检查这些产物，**只补做未完成的步骤**，已完成的不重做，从而省下最贵的逐页生成。\n\n"
+        "前提：源文件或项目目录仍存在(只有 DONE 成功后才会清理它们，所以失败/中断的任务通常可重试)。\n\n"
+        "适用场景：\n"
+        "- 中转站/模型调用抖动导致失败(系统已自动重试 2 次仍失败 → INTERRUPTED)；\n"
+        "- 服务重启导致进行中的任务被标记为 INTERRUPTED；\n"
+        "- R2 上传失败留下的本地产物。\n\n"
+        "调用后任务回到 PENDING 并由工作池择机执行；用 `GET /api/presentations/{job_id}` 继续轮询进度。\n\n"
+        "状态非 FAILED/INTERRUPTED(如仍在处理或已 DONE)返回 409；源/项目均已不存在返回 409。"
+    ),
     responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
 )
 async def retry_presentation(job_id: str) -> ActionResponse:

@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import threading
 import time
-import zipfile
 from pathlib import Path
 
 from . import storage
@@ -204,41 +203,35 @@ def _run_agent_with_retries(job_id: str, handle: RunHandle, project_path: Path, 
 
 def _finalize_delivery(job_id: str, project_path: Path, pptx: Path,
                        upload_path: Path | None) -> None:
-    """Package the deck + extracted speaker notes into a single .zip, upload only
-    that zip to R2, then delete local artifacts. On upload failure mark
-    INTERRUPTED and keep everything for inspection/retry."""
+    """Upload the deck and the extracted speaker-notes .md as two separate public
+    objects under the job's R2 prefix, persist both URLs, then delete local
+    artifacts. On the deck-upload failure mark INTERRUPTED and keep everything
+    for inspection/retry."""
+    pptx_ct = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     try:
-        zip_path = _build_zip(project_path, pptx)
-        r2_key, r2_url = storage.upload_file(job_id, zip_path, "application/zip")
+        r2_key, r2_url = storage.upload_file(job_id, pptx, pptx_ct)
     except Exception as exc:  # noqa: BLE001
         store.update(
             job_id, status=JobStatus.INTERRUPTED, error=f"R2 upload failed: {exc}",
-            message="产物打包/上传对象存储失败，已保留本地文件以便排查。",
+            message="产物上传对象存储失败，已保留本地文件以便排查。",
         )
         return
 
     store.update(job_id, r2_key=r2_key, r2_url=r2_url)
+
+    # Speaker notes: extract to a single .md and upload as a second object.
+    # Best-effort — a notes failure must never fail an otherwise-good job.
+    try:
+        notes_md = build_speaker_notes_md(project_path, pptx)
+        if notes_md is not None and notes_md.is_file():
+            notes_key, notes_url = storage.upload_file(job_id, notes_md, "text/markdown; charset=utf-8")
+            store.update(job_id, notes_key=notes_key, notes_url=notes_url)
+    except Exception:  # noqa: BLE001
+        pass
+
     _cleanup_local(project_path, upload_path)
     store.update(job_id, status=JobStatus.DONE, project_path=None, pptx_path=None,
                  progress=100, message="生成完成。", error=None)
-
-
-def _build_zip(project_path: Path, pptx: Path) -> Path:
-    """Bundle the .pptx and the extracted speaker-notes .md into exports/<deck>.zip.
-    The notes file is best-effort: if there are no notes, the zip holds just the
-    deck."""
-    deck_stem = pptx.stem
-    zip_path = pptx.with_name(f"{deck_stem}.zip")
-    notes_md = None
-    try:
-        notes_md = build_speaker_notes_md(project_path, pptx)
-    except Exception:  # noqa: BLE001
-        notes_md = None
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(pptx, arcname=pptx.name)
-        if notes_md is not None and notes_md.is_file():
-            zf.write(notes_md, arcname=notes_md.name)
-    return zip_path
 
 
 def _handle_cancel(job_id: str, project_path: Path | None) -> None:

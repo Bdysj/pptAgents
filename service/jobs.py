@@ -32,12 +32,15 @@ class Job:
     canvas_format: str
     upload_path: Path
     options: dict[str, str | None] = field(default_factory=dict)
+    fingerprint: str | None = None
     status: JobStatus = JobStatus.PENDING
     message: str = ""
     project_path: Path | None = None
     pptx_path: Path | None = None
     r2_key: str | None = None
     r2_url: str | None = None
+    notes_key: str | None = None
+    notes_url: str | None = None
     error: str | None = None
     log_tail: str = ""
     progress: int = 0
@@ -48,8 +51,8 @@ class Job:
 
 
 _SCALAR_FIELDS = (
-    "source_filename", "canvas_format", "status", "message",
-    "r2_key", "r2_url", "error", "log_tail",
+    "source_filename", "canvas_format", "status", "message", "fingerprint",
+    "r2_key", "r2_url", "notes_key", "notes_url", "error", "log_tail",
     "progress", "attempts", "heartbeat_at", "created_at", "updated_at",
 )
 _PATH_FIELDS = ("upload_path", "project_path", "pptx_path")
@@ -68,12 +71,15 @@ def _row_to_job(row: JobRow) -> Job:
         canvas_format=row.canvas_format or "",
         upload_path=Path(row.upload_path) if row.upload_path else Path(""),
         options=options,
+        fingerprint=row.fingerprint,
         status=JobStatus(row.status),
         message=row.message or "",
         project_path=Path(row.project_path) if row.project_path else None,
         pptx_path=Path(row.pptx_path) if row.pptx_path else None,
         r2_key=row.r2_key,
         r2_url=row.r2_url,
+        notes_key=row.notes_key,
+        notes_url=row.notes_url,
         error=row.error,
         log_tail=row.log_tail or "",
         progress=row.progress or 0,
@@ -88,7 +94,8 @@ class JobStore:
     """Database-backed job store. Thread-safe via short-lived sessions."""
 
     def create(self, source_filename: str, canvas_format: str, upload_path: Path,
-               options: dict[str, str | None] | None = None) -> Job:
+               options: dict[str, str | None] | None = None,
+               fingerprint: str | None = None) -> Job:
         job_id = uuid.uuid4().hex[:12]
         now = _now()
         Session = session_factory()
@@ -97,6 +104,7 @@ class JobStore:
                 job_id=job_id,
                 source_filename=source_filename,
                 canvas_format=canvas_format,
+                fingerprint=fingerprint,
                 status=JobStatus.PENDING.value,
                 message="",
                 upload_path=str(upload_path),
@@ -110,6 +118,24 @@ class JobStore:
             session.add(row)
             session.commit()
             return _row_to_job(row)
+
+    def find_reusable(self, fingerprint: str) -> Job | None:
+        """Return the most recent job with the same fingerprint that is either
+        in flight (PENDING/CONVERTING/GENERATING) or already DONE — so repeated
+        identical submissions reuse it. FAILED/CANCELLED/INTERRUPTED/EXPIRED are
+        intentionally NOT reused (a re-submit after those should start fresh)."""
+        if not fingerprint:
+            return None
+        reusable = [s.value for s in ACTIVE_STATUSES] + [JobStatus.DONE.value]
+        Session = session_factory()
+        with Session() as session:
+            row = session.execute(
+                select(JobRow)
+                .where(JobRow.fingerprint == fingerprint, JobRow.status.in_(reusable))
+                .order_by(JobRow.created_at.desc())
+                .limit(1)
+            ).scalars().first()
+            return _row_to_job(row) if row else None
 
     def get(self, job_id: str) -> Job | None:
         Session = session_factory()

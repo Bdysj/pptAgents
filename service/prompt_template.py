@@ -52,6 +52,64 @@ def _opt(options: dict, key: str) -> str | None:
     return value or None
 
 
+# ── Style presets ─────────────────────────────────────────────────────────────
+# Each preset resolves to the underlying eight-confirmation fields the prompt
+# already consumes: a style_objective that steers the Executor to the right
+# reference file (executor-general / executor-consultant / executor-consultant-top),
+# a color scheme (config.py DESIGN_COLORS), default typography and icon style.
+STYLE_PRESETS: dict[str, dict[str, str]] = {
+    "modern": {
+        "style_objective": ("通用现代风格（对应 executor-general）：信息层级清晰、留白克制、"
+                            "适合大多数商务/技术汇报。"),
+        "color_scheme": "通用现代配色（general）：蓝绿橙点缀、白底、专业明快。",
+        "typography": "无衬线字体，中英文混排。",
+        "icon_style": "line",
+    },
+    "mckinsey": {
+        "style_objective": ("顶级咨询/麦肯锡(MBB)风格（对应 executor-consultant-top）：金字塔结构、"
+                            "结论先行、每页一句 Takeaway、数据必配对比基准、SCQA 叙事。"),
+        "color_scheme": "咨询配色（consulting）：深蓝主色 + 克制点缀，庄重权威。",
+        "typography": "无衬线字体，信息密度偏高（body 14–18px 基线）。",
+        "icon_style": "line",
+    },
+    "consulting": {
+        "style_objective": ("商务咨询风格（对应 executor-consultant）：论点清晰、图表驱动、"
+                            "专业稳重，适合方案/尽调/汇报。"),
+        "color_scheme": "咨询配色（consulting）：深蓝主色，专业沉稳。",
+        "typography": "无衬线字体，中英文混排。",
+        "icon_style": "line",
+    },
+    "tech": {
+        "style_objective": ("科技/产品风格（对应 executor-general）：现代、利落、强调架构与流程，"
+                            "适合产品发布、技术方案。"),
+        "color_scheme": "科技配色（tech）：深色背景 + 青紫荧光点缀，未来感。",
+        "typography": "无衬线字体，中英文混排。",
+        "icon_style": "line",
+    },
+    "academic": {
+        "style_objective": ("学术/科研风格（对应 executor-general）：严谨克制、重公式与图表、"
+                            "适合论文汇报、开题答辩、学术报告。"),
+        "color_scheme": "学术配色（academic）：暗红 + 深蓝 + 金，沉稳学术。",
+        "typography": "无衬线字体为主，公式清晰；中英文混排。",
+        "icon_style": "line",
+    },
+    "government": {
+        "style_objective": ("政务/党政风格（对应 executor-general）：庄重、权威、规范，"
+                            "适合工作汇报、政策解读、单位总结。"),
+        "color_scheme": "政务配色（government）：党政红 + 深蓝 + 金，庄重正式。",
+        "typography": "无衬线字体，标题厚重；中英文混排。",
+        "icon_style": "filled",
+    },
+}
+
+
+def resolve_style_preset(preset: str | None) -> dict[str, str]:
+    """Translate a style preset key into the underlying option fields. Unknown /
+    empty falls back to 'modern'."""
+    key = (preset or "modern").strip().lower()
+    return STYLE_PRESETS.get(key, STYLE_PRESETS["modern"])
+
+
 def resolve_eight(canvas_format: str, options: dict) -> dict[int, str]:
     """Resolve the eight confirmations from options + defaults."""
     icon_style = (_opt(options, "icon_style") or "line").lower()
