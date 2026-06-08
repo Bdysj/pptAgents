@@ -110,6 +110,45 @@ def resolve_style_preset(preset: str | None) -> dict[str, str]:
     return STYLE_PRESETS.get(key, STYLE_PRESETS["modern"])
 
 
+# ── Color scheme presets (grounded in scripts/config.py DESIGN_COLORS) ────────
+COLOR_SCHEME_TEXT: dict[str, str] = {
+    "consulting": "咨询配色（consulting）：深蓝主色 + 克制点缀，专业庄重。",
+    "general": "通用现代配色（general）：蓝/绿/橙点缀、白底，明快专业。",
+    "tech": "科技配色（tech）：深色背景 + 青紫荧光点缀，未来科技感。",
+    "academic": "学术配色（academic）：暗红 + 深蓝 + 金，沉稳严谨。",
+    "government": "政务配色（government）：党政红 + 深蓝 + 金，庄重正式。",
+}
+
+
+def resolve_color_scheme(key: str | None, preset: dict[str, str]) -> str:
+    """'auto' (or unknown) keeps the style preset's color; otherwise override."""
+    k = (key or "auto").strip().lower()
+    if k == "auto" or k not in COLOR_SCHEME_TEXT:
+        return preset["color_scheme"]
+    return COLOR_SCHEME_TEXT[k]
+
+
+# ── Audience presets ──────────────────────────────────────────────────────────
+AUDIENCE_TEXT: dict[str, str] = {
+    "executives": "公司高管 / 决策层：结论先行，强调商业影响、决策建议与 ROI。",
+    "investors": "投资人 / 资方：强调市场空间、增长、商业模式、回报与风险。",
+    "technical": "技术 / 工程读者：强调架构、实现细节、数据与权衡。",
+    "academic": "学术 / 科研同行：严谨论证，重方法、证据与结论。",
+    "government": "政府 / 评审机构：规范、权威、合规的表述与结构。",
+    "general": "通用大众读者：通俗易懂、少术语、多类比。",
+    "students": "学生 / 教学场景：循序渐进、重讲解与示例。",
+    "internal": "公司内部团队：务实，聚焦执行、分工与协作。",
+}
+
+
+def resolve_audience(key: str | None) -> str | None:
+    """'auto' → None (Strategist infers); otherwise a concrete audience brief."""
+    k = (key or "auto").strip().lower()
+    if k == "auto":
+        return None
+    return AUDIENCE_TEXT.get(k)
+
+
 def resolve_eight(canvas_format: str, options: dict) -> dict[int, str]:
     """Resolve the eight confirmations from options + defaults."""
     icon_style = (_opt(options, "icon_style") or "line").lower()

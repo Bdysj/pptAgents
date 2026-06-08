@@ -25,17 +25,17 @@ from .config import settings
 from .db import init_db
 from .jobs import store
 from .progress import compute_progress
-from .prompt_template import resolve_style_preset
+from .prompt_template import resolve_audience, resolve_color_scheme, resolve_style_preset
 from .registry import registry
 from .schemas import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     ActionResponse,
-    CanvasFormat,
+    Audience,
+    ColorScheme,
     CreateJobResponse,
     ErrorResponse,
-    FormulaPolicy,
-    ImageMode,
+    IconStyle,
     JobStatus,
     JobStatusResponse,
     OutputLanguage,
@@ -84,7 +84,10 @@ def healthz() -> dict[str, str]:
         "**幂等 / 防重放**：请求指纹 = 文件内容(SHA-256) + 全部生成参数。若已存在**相同文件且相同参数**、"
         "且处于进行中(PENDING/CONVERTING/GENERATING)或已完成(DONE)的任务，则**直接复用并返回那个 job_id**，"
         "不会重复创建——多次点击/重复提交安全。失败、取消、中断、过期的任务不在复用范围(重交即重跑)。"
-        "改动任意参数或更换文件会被视为新任务。"
+        "改动任意参数或更换文件会被视为新任务。\n\n"
+        "**参数说明**：画布固定 16:9、配图固定 AI、公式固定 mixed（不暴露）。常规调用只需 `file` + `style`；"
+        "`color_scheme`/`audience` 为枚举(默认 auto=跟随 style/自动推断)；`page_count`/`output_language` 选填；"
+        "`icon_style` 是选填的高级覆盖项，留空即用 `style` 预设默认。"
     ),
     responses={400: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
 )
@@ -93,25 +96,10 @@ async def create_presentation(
         ...,
         description="源文档：PDF / DOCX / Markdown / PPTX / XLSX / TXT 等。系统会自动转换为 Markdown 再生成。",
     ),
-    canvas_format: CanvasFormat = Form(
-        CanvasFormat.ppt169,
-        description=(
-            "画布尺寸/比例（决定产物长宽）。\n"
-            "• ppt169 —— 16:9 横版 PPT(1280×720)。【最常用】现代投影、线上汇报。\n"
-            "• ppt43 —— 4:3 横版 PPT(1024×768)。传统投影、老会议室、学术答辩。\n"
-            "• xiaohongshu —— 小红书竖图(1242×1660, 3:4)。图文种草、知识贴。\n"
-            "• moments —— 朋友圈/IG 方图(1080×1080, 1:1)。社交方形海报。\n"
-            "• story —— 竖屏故事(1080×1920, 9:16)。短视频封面、Story。\n"
-            "• wechat —— 公众号头图(900×383, 2.35:1)。文章封面。\n"
-            "• banner —— 横幅(1920×1080, 16:9)。网页 banner、大屏。\n"
-            "• a4 —— A4 打印(1240×1754)。打印/PDF。\n"
-            "选择建议：做汇报/演示选 ppt169(默认)；老设备/答辩选 ppt43；社媒内容按平台选对应竖/方图。"
-        ),
-    ),
     style: StylePreset = Form(
         StylePreset.modern,
         description=(
-            "整体风格预设（同时决定版式语气与配色，已替代零散的风格/配色/字体/图标设置）。\n"
+            "整体风格预设（决定版式语气 + 默认配色，对应代码里的 executor 风格文件）。\n"
             "• modern —— 通用现代。【默认】信息层级清晰、留白克制，适合绝大多数商务/技术汇报。\n"
             "• mckinsey —— 顶级咨询(麦肯锡/MBB)。金字塔结构、结论先行、每页一句 Takeaway、数据配对比基准。"
             "适合战略汇报、投资/尽调、高管决策材料。\n"
@@ -119,6 +107,34 @@ async def create_presentation(
             "• tech —— 科技/产品。深色科技配色、强调架构与流程。适合产品发布、技术方案。\n"
             "• academic —— 学术/科研。严谨克制、重公式与图表。适合论文汇报、开题答辩、学术报告。\n"
             "• government —— 政务/党政。庄重权威、规范。适合工作汇报、政策解读、单位总结。"
+        ),
+    ),
+    color_scheme: ColorScheme = Form(
+        ColorScheme.auto,
+        description=(
+            "配色方案（来自代码 config.py 的 DESIGN_COLORS）。\n"
+            "• auto —— 【默认】跟随所选 style 预设的配色。\n"
+            "• consulting —— 深蓝主色 + 克制点缀，专业庄重。\n"
+            "• general —— 蓝/绿/橙点缀、白底，明快专业。\n"
+            "• tech —— 深色背景 + 青紫荧光点缀，科技未来感。\n"
+            "• academic —— 暗红 + 深蓝 + 金，沉稳严谨。\n"
+            "• government —— 党政红 + 深蓝 + 金，庄重正式。\n"
+            "选 auto 即可；想让配色与 style 不同(如 modern 版式配 tech 深色)时再单独指定。"
+        ),
+    ),
+    audience: Audience = Form(
+        Audience.auto,
+        description=(
+            "目标受众（影响措辞、详略与论证侧重）。\n"
+            "• auto —— 【默认】由策划根据素材内容与 style 自动推断。\n"
+            "• executives —— 公司高管/决策层：结论先行，重商业影响与决策建议。\n"
+            "• investors —— 投资人/资方：重市场、增长、商业模式、回报与风险。\n"
+            "• technical —— 技术/工程读者：重架构、实现细节、数据与权衡。\n"
+            "• academic —— 学术/科研同行：严谨论证，重方法与证据。\n"
+            "• government —— 政府/评审机构：规范、权威、合规表述。\n"
+            "• general —— 通用大众：通俗易懂、少术语。\n"
+            "• students —— 学生/教学：循序渐进、重讲解与示例。\n"
+            "• internal —— 公司内部团队：务实，聚焦执行与协作。"
         ),
     ),
     page_count: int | None = Form(
@@ -130,25 +146,6 @@ async def create_presentation(
             "填具体数字则按该页数生成；常用区间：精简 8–12、标准 12–18、详尽 18–28。"
         ),
     ),
-    image_mode: ImageMode = Form(
-        ImageMode.ai,
-        description=(
-            "配图方式。\n"
-            "• ai —— 关键页用 AI(gpt-image-2)生成配图。【默认】成稿最完整，耗时/成本最高。\n"
-            "• web —— 关键页用网络图片搜索。真实图片，需联网。\n"
-            "• placeholder —— 仅用占位图，不实际拉图。最快，适合先看版式。\n"
-            "• none —— 纯文字/图形版式，完全不配图。适合极简或纯数据稿。"
-        ),
-    ),
-    formula_policy: FormulaPolicy = Form(
-        FormulaPolicy.mixed,
-        description=(
-            "公式渲染策略(仅含公式的稿件才有意义，如学术/技术)。\n"
-            "• mixed —— 【默认】复杂公式渲染成图片，简单表达式保留可编辑文本。\n"
-            "• render-all —— 所有公式都渲染成图片(最稳定，但不可编辑)。\n"
-            "• text-only —— 全部保留为可编辑文本/Unicode(可编辑，复杂公式可能不美观)。"
-        ),
-    ),
     output_language: OutputLanguage = Form(
         OutputLanguage.auto,
         description=(
@@ -158,6 +155,15 @@ async def create_presentation(
             "• ja —— 日本語。  • ko —— 한국어。  • fr —— Français。\n"
             "• de —— Deutsch。  • es —— Español。  • ru —— Русский。\n"
             "典型用法：英文 docx 想输出中文汇报 → 选 zh。"
+        ),
+    ),
+    icon_style: IconStyle | None = Form(
+        None,
+        description=(
+            "【高级覆盖·选填】图标风格。留空=采用 style 预设默认(多为 line)。\n"
+            "• line —— 线性图标，轻盈现代。\n"
+            "• filled —— 实心图标，醒目厚重(政务/强调场景)。\n"
+            "• none —— 不使用图标。"
         ),
     ),
 ) -> CreateJobResponse:
@@ -190,17 +196,30 @@ async def create_presentation(
     # Resolve the style preset into the underlying eight-confirmation fields.
     preset = resolve_style_preset(style.value)
     lang = None if output_language == OutputLanguage.auto else output_language.value
+    # Fixed (not user-selectable): canvas 16:9, AI illustrations, mixed formulas.
+    fixed_canvas = "ppt169"
+    fixed_image_mode = "ai"
+    fixed_formula_policy = "mixed"
+    # color_scheme / audience: enum -> concrete brief ('auto' keeps preset/infer).
+    eff_color_scheme = resolve_color_scheme(color_scheme.value, preset)
+    eff_audience = resolve_audience(audience.value)
+    eff_typography = preset["typography"]
+    eff_icon_style = icon_style.value if icon_style is not None else preset["icon_style"]
 
     # Request fingerprint = file content + every parameter that affects output.
     fp_payload = json.dumps(
         {
             "file": file_hash,
-            "canvas_format": canvas_format.value,
+            "canvas_format": fixed_canvas,
             "style": style.value,
             "page_count": page_count,
-            "image_mode": image_mode.value,
-            "formula_policy": formula_policy.value,
+            "image_mode": fixed_image_mode,
+            "formula_policy": fixed_formula_policy,
             "output_language": lang or "auto",
+            "color_scheme": color_scheme.value,
+            "audience": audience.value,
+            "typography": eff_typography,
+            "icon_style": eff_icon_style,
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -230,18 +249,18 @@ async def create_presentation(
 
     options = {
         "page_count": str(page_count) if page_count else None,
-        "audience": None,  # inferred by the Strategist from content + style
+        "audience": eff_audience,  # None = Strategist infers from content + style
         "style_objective": preset["style_objective"],
-        "color_scheme": preset["color_scheme"],
-        "icon_style": preset["icon_style"],
-        "typography": preset["typography"],
-        "formula_policy": formula_policy.value,
-        "image_mode": image_mode.value,
+        "color_scheme": eff_color_scheme,
+        "icon_style": eff_icon_style,
+        "typography": eff_typography,
+        "formula_policy": fixed_formula_policy,
+        "image_mode": fixed_image_mode,
         "output_language": lang,
         "style_preset": style.value,
     }
     job = store.create(
-        source_filename=safe_name, canvas_format=canvas_format.value,
+        source_filename=safe_name, canvas_format=fixed_canvas,
         upload_path=dest, options=options, fingerprint=fingerprint,
     )
     await queue.enqueue(job.job_id)

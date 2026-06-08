@@ -73,6 +73,29 @@ class OutputLanguage(str, Enum):
     ru = "ru"
 
 
+class ColorScheme(str, Enum):
+    """Color scheme (grounded in config.py DESIGN_COLORS)."""
+    auto = "auto"
+    consulting = "consulting"
+    general = "general"
+    tech = "tech"
+    academic = "academic"
+    government = "government"
+
+
+class Audience(str, Enum):
+    """Target audience preset."""
+    auto = "auto"
+    executives = "executives"
+    investors = "investors"
+    technical = "technical"
+    academic = "academic"
+    government = "government"
+    general = "general"
+    students = "students"
+    internal = "internal"
+
+
 class FormulaPolicy(str, Enum):
     mixed = "mixed"
     render_all = "render-all"
