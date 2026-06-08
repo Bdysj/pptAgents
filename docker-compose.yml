@@ -1,0 +1,44 @@
+services:
+  ppt-master-service:
+    build: .
+    image: ppt-master-service:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # ── Brain LLM relay (Claude protocol) ──────────────────────────
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.vectorengine.ai}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:?set ANTHROPIC_AUTH_TOKEN in .env}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-opus-4-8}
+      CLAUDE_PERMISSION_MODE: ${CLAUDE_PERMISSION_MODE:-bypassPermissions}
+
+      # ── Image model relay (OpenAI protocol, gpt-image-2) ───────────
+      IMAGE_BACKEND: ${IMAGE_BACKEND:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.vectorengine.ai/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-image-2}
+
+      # ── Job execution ──────────────────────────────────────────────
+      PPT_JOB_TIMEOUT: ${PPT_JOB_TIMEOUT:-3600}
+      PPT_MAX_CONCURRENCY: ${PPT_MAX_CONCURRENCY:-20}
+      PPT_DEFAULT_FORMAT: ${PPT_DEFAULT_FORMAT:-ppt169}
+      PPT_AGENT_RETRIES: ${PPT_AGENT_RETRIES:-2}
+      PPT_HEARTBEAT_SECONDS: ${PPT_HEARTBEAT_SECONDS:-30}
+      PPT_JOB_EXPIRE_DAYS: ${PPT_JOB_EXPIRE_DAYS:-3}
+      PPT_REAPER_INTERVAL_SECONDS: ${PPT_REAPER_INTERVAL_SECONDS:-3600}
+      PPT_QUEUE_MAX_PENDING: ${PPT_QUEUE_MAX_PENDING:-0}
+
+      # ── Persistence (MySQL via SQLAlchemy) ─────────────────────────
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+
+      # ── Cloudflare R2 object storage ───────────────────────────────
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:?set R2_ACCOUNT_ID in .env}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID in .env}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY in .env}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:?set R2_BUCKET_NAME in .env}
+      R2_PUBLIC_DOMAIN: ${R2_PUBLIC_DOMAIN:?set R2_PUBLIC_DOMAIN in .env}
+      R2_USE_HTTPS: ${R2_USE_HTTPS:-true}
+      R2_KEY_PREFIX: ${R2_KEY_PREFIX:-presentations}
+    volumes:
+      # Persist generated projects and exports outside the container.
+      - ./projects:/app/projects
+      - ./uploads:/app/uploads

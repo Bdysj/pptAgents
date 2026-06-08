@@ -1,0 +1,9 @@
+# FastAPI service layer dependencies (in addition to skill requirements.txt).
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# Persistence + object storage.
+SQLAlchemy>=2.0.0
+PyMySQL>=1.1.0
+boto3>=1.34.0
