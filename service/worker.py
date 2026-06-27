@@ -151,9 +151,13 @@ def process_job(job_id: str) -> None:
 
         pptx = _find_pptx(project_path, result.stdout)
         if pptx is None:
-            store.update(job_id, status=JobStatus.INTERRUPTED,
-                         error="agent finished but no .pptx was found in exports/",
-                         message="未找到导出的 PPTX，已标记为未完成。")
+            total_runs = 1 + max(0, settings.agent_retries)
+            store.update(
+                job_id, status=JobStatus.INTERRUPTED,
+                error=(f"agent exited cleanly but produced no .pptx after "
+                       f"{total_runs} attempt(s)"),
+                message="多次续跑后仍未产出 PPTX，已标记为未完成（保留现场，可手动重试）。",
+            )
             return
 
         store.update(job_id, pptx_path=pptx, message="正在上传产物到对象存储…")
@@ -169,7 +173,15 @@ def process_job(job_id: str) -> None:
 def _run_agent_with_retries(job_id: str, handle: RunHandle, project_path: Path, job):
     """Run the agent up to (1 + agent_retries) times. First run uses the full
     generation prompt for a fresh job, or the resume prompt for a retry; every
-    subsequent attempt uses the resume prompt so completed work is preserved."""
+    subsequent attempt uses the resume prompt so completed work is preserved.
+
+    An attempt is a *success* only when the agent exits cleanly (returncode 0,
+    not timed out) AND a delivered ``.pptx`` is actually present. A clean exit
+    that produced no deck — e.g. the underlying LLM stopped early with no error
+    and no output — is treated as a retryable failure and re-driven with the
+    resume prompt, so already-produced SVGs are reused rather than regenerated.
+    This closes the gap where exit-0-but-empty runs were accepted as done and
+    immediately marked INTERRUPTED without ever consuming the retry budget."""
     total_runs = 1 + max(0, settings.agent_retries)
     started_resumed = job.project_path is not None and Path(job.project_path).is_dir()
     result = None
@@ -185,17 +197,34 @@ def _run_agent_with_retries(job_id: str, handle: RunHandle, project_path: Path, 
         store.update(
             job_id, status=JobStatus.GENERATING, attempts=(job.attempts + attempt + 1),
             message=("智能体正在生成幻灯片并导出 PPTX…" if attempt == 0
-                     else f"上次中断，正在第 {attempt} 次续跑…"),
+                     else f"上次未产出成品，正在第 {attempt} 次续跑…"),
         )
         result = run_agent(prompt, handle)
 
-        tail = (result.stdout or "")[-settings.log_tail_chars:]
-        store.update(job_id, log_tail=tail)
+        # Persist a debugging tail. Prefer stdout; fall back to stderr when the
+        # agent exited with empty stdout (the "stopped for no reason" case), so
+        # the post-mortem is not blank.
+        tail_src = result.stdout or ""
+        if not tail_src.strip() and (result.stderr or "").strip():
+            tail_src = f"[no stdout; stderr tail]\n{result.stderr}"
+        store.update(job_id, log_tail=tail_src[-settings.log_tail_chars:])
 
         if result.cancelled:
             return result
-        if not result.timed_out and result.returncode == 0:
-            return result  # success
+
+        # Success requires BOTH a clean exit AND an actual delivered deck.
+        clean_exit = not result.timed_out and result.returncode == 0
+        if clean_exit and _find_pptx(project_path, result.stdout) is not None:
+            return result
+
+        # Otherwise retryable: hard failure (non-zero/timeout) OR a clean-but-
+        # empty exit (no .pptx). Re-drive with the resume prompt next round.
+        if clean_exit:
+            store.update(
+                job_id,
+                message="智能体已退出但未产出 PPTX，准备续跑…",
+                error="agent exited cleanly without producing a .pptx",
+            )
         if attempt < total_runs - 1:
             time.sleep(min(5 * (attempt + 1), 30))  # small backoff before resume
     return result

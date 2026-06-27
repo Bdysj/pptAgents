@@ -38,7 +38,17 @@ services:
       R2_PUBLIC_DOMAIN: ${R2_PUBLIC_DOMAIN:?set R2_PUBLIC_DOMAIN in .env}
       R2_USE_HTTPS: ${R2_USE_HTTPS:-true}
       R2_KEY_PREFIX: ${R2_KEY_PREFIX:-presentations}
+
+      # ── Timezone ───────────────────────────────────────────────────
+      # Explicit override + fallback. The /etc/localtime bind mount below makes
+      # the container follow the HOST timezone exactly; TZ only matters when that
+      # mount is absent. Override via TZ in .env if your server isn't Asia/Shanghai.
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
       # Persist generated projects and exports outside the container.
       - ./projects:/app/projects
       - ./uploads:/app/uploads
+      # Match the host's wall-clock timezone so log timestamps line up with the
+      # server. Read-only; auto-follows whatever timezone the host is set to.
+      - /etc/localtime:/etc/localtime:ro
+

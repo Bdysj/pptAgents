@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # System deps: Node.js (for Claude Code), pandoc + cairo for the skill's converters,
 # plus a C toolchain + cairo/ffi dev headers so cairosvg/pycairo/cairocffi can build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl gnupg ca-certificates \
+        curl gnupg ca-certificates tzdata \
         build-essential pkg-config \
         pandoc libcairo2 libcairo2-dev libffi-dev \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \

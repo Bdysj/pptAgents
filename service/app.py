@@ -54,8 +54,39 @@ app = FastAPI(
 )
 
 
+def _configure_request_log_timestamps() -> None:
+    """Prepend an ISO timestamp to uvicorn's error + access log lines.
+
+    Uvicorn's stock formatters omit the time, so container logs read like
+    ``INFO: 1.2.3.4 - "GET /x" 200`` with no way to correlate events. We reuse
+    uvicorn's own formatter classes (so the access fields still render) but with
+    a `%(asctime)s` prefix, and swap them onto the already-installed handlers.
+
+    Called from startup so it runs *after* uvicorn has configured logging —
+    therefore it sticks whether launched via the `uvicorn` CLI or programmatically.
+    Best-effort: if uvicorn isn't the runner, this is a harmless no-op."""
+    try:
+        import logging
+
+        from uvicorn.logging import AccessFormatter, DefaultFormatter
+    except Exception:  # noqa: BLE001 — uvicorn not present / unexpected layout
+        return
+
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    default_fmt = "%(asctime)s %(levelprefix)s %(message)s"
+    access_fmt = (
+        '%(asctime)s %(levelprefix)s %(client_addr)s - '
+        '"%(request_line)s" %(status_code)s'
+    )
+    for handler in logging.getLogger("uvicorn").handlers:
+        handler.setFormatter(DefaultFormatter(fmt=default_fmt, datefmt=datefmt))
+    for handler in logging.getLogger("uvicorn.access").handlers:
+        handler.setFormatter(AccessFormatter(fmt=access_fmt, datefmt=datefmt))
+
+
 @app.on_event("startup")
 async def _startup() -> None:
+    _configure_request_log_timestamps()
     settings.ensure_dirs()
     init_db()
     await queue.reconcile()
